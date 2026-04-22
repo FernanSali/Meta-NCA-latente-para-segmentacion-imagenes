@@ -1,0 +1,1 @@
+# Meta-NCA-latente-para-segmentacion-imagenes
