@@ -123,7 +123,7 @@ class AutoEncoderDown3(nn.Module):
 
 ## definimos aca el latentNCA
 class LatentNCA(nn.Module):
-    def __init__(self, channels=256, hidden_dims=128):
+    def __init__(self, channels=16, hidden_dims=128):
         super().__init__()
         self.channels = channels
         
