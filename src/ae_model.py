@@ -15,7 +15,9 @@ pip freeze > requirements.txt
 from torch.utils.data import Dataset
 import torch
 import torch.nn as nn 
+import torch.optim as optim
 
+## AdjConv2D del paper
 class AdjConv2D(nn.Module):
     def __init__(self, in_c, out_c, kernel_size, strides, padding, activation, batch_normalization, dropout_rate):
         super().__init__()
@@ -38,6 +40,7 @@ class AdjConv2D(nn.Module):
     def forward(self, x):
         return self.seq(x)
 
+## AdjConv2D Transpose del paper
 class AdjConv2DTranspose(nn.Module):
     def __init__(self, in_c, out_c, kernel_size, strides, padding, activation, batch_normalization, dropout_rate):
         super().__init__()
@@ -62,7 +65,7 @@ class AdjConv2DTranspose(nn.Module):
     def forward(self, x):
         return self.seq(x)
     
-
+## arquitectura autoencoder entera
 class AutoEncoderDown3(nn.Module):
     def __init__(self, params):
         super().__init__()
@@ -119,14 +122,113 @@ class AutoEncoderDown3(nn.Module):
 
 
 
+## definimos aca el latentNCA
+class LatentNCA(nn.Module):
+    def __init__(self, channels=256, hidden_dims=128):
+        super().__init__()
+        self.channels = channels
+        
+        # Percepción: Usamos una convolución agrupada para actuar como filtros locales
+        # Esto es equivalente a que cada canal "vea" su vecindad
+        self.perception = nn.Conv2d(channels, channels * 3, kernel_size=3, 
+                                    padding=1, groups=channels, bias=False)
+        
+        # Regla de actualización: Un MLP (convoluciones 1x1)
+        self.update_rule = nn.Sequential(
+            nn.Conv2d(channels * 3, hidden_dims, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dims, channels, kernel_size=1)
+        )
+        
+        # Inicialización: Empezamos con actualizaciones casi nulas para estabilidad
+        nn.init.zeros_(self.update_rule[-1].weight)
+        nn.init.zeros_(self.update_rule[-1].bias)
+
+    def forward(self, x, steps=10):
+        for _ in range(steps):
+            # 1. Percibir vecinos
+            perceived = self.perception(x)
+            # 2. Calcular delta (cambio)
+            delta = self.update_rule(perceived)
+            # 3. Aplicar actualización estocástica (estilo NCA original)
+            # Solo algunas células se actualizan en cada paso para fomentar robustez
+            mask = (torch.rand(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device) > 0.5).float()
+            x = x + delta * mask
+        return x
+    
+
+## integramos el autoencoder con el NCA en un modelo 
+class NCASegmenter(nn.Module):
+    def __init__(self, ae_params, nca_steps=8):
+        super().__init__()
+        # Instanciamos tu modelo original
+        self.ae = AutoEncoderDown3(ae_params)
+        self.nca_steps = nca_steps
+        
+        # El NCA opera sobre los canales del espacio latente (256 según tus params[cite: 1])
+        latent_channels = ae_params['Conv2DParams3']['out_c']
+        self.nca = LatentNCA(channels=latent_channels)
+
+    def forward(self, x):
+        # --- PASO 1: ENCODER ---
+        # Ejecutamos las capas de tu encoder manualmente para guardar el 'skip_out'[cite: 1]
+        c1_out = self.ae.conv_layer_1(x) # Este es el skip que necesita el decoder final
+        c2_out = self.ae.conv_layer_2(c1_out)
+        
+        p1_out = self.ae.pass_through_1(x)
+        p2_out = self.ae.pass_through_2(p1_out)
+        
+        sum_enc = c2_out + p2_out 
+        latent = self.ae.conv_layer_3(sum_enc)
+        
+        # --- PASO 2: EVOLUCIÓN NCA ---
+        # El NCA refina el espacio latente
+        latent_evolved = self.nca(latent, steps=self.nca_steps)
+        
+        # --- PASO 3: DECODER ---
+        # Usamos las capas del decoder de tu modelo original[cite: 1]
+        d3_out = self.ae.trans_conv_3(latent_evolved)
+        d2_out = self.ae.trans_conv_2(d3_out)
+        
+        # Reinyectamos el skip connection guardado en el paso 1
+        sum_dec = d2_out + c1_out 
+        
+        mixed = self.ae.mix_layer(sum_dec)
+        reconstruction = self.ae.trans_conv_1(mixed)
+        
+        return reconstruction, latent_evolved
 
 
+## funcion de referencia para entrenar el modelo entrenado de forma entera
 
-
-
-
-
-
-
-
-print("Corrido sin errrores")
+def train_nca(model, train_loader, epochs=10, device='cuda'):
+    # CONGELAMOS EL AUTOENCODER[cite: 1]
+    # Solo queremos que aprenda la "regla de actualización" del NCA
+    for param in model.ae.parameters():
+        param.requires_grad = False
+        
+    # El optimizador solo ve los parámetros del NCA
+    optimizer = optim.Adam(model.nca.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+    
+    model.to(device)
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        
+        for imgs, masks in train_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward: Obtenemos la máscara predicha
+            outputs, _ = model(imgs)
+            
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        print(f"Época [{epoch+1}/{epochs}] - Loss: {total_loss/len(train_loader):.4f}")
