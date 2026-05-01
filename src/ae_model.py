@@ -22,7 +22,7 @@ class AdjConv2D(nn.Module):
     def __init__(self, in_c, out_c, kernel_size, strides, padding, activation, batch_normalization, dropout_rate):
         super().__init__()
         layers = []
-        # En PyTorch el padding debe ser entero (ej: 1 para 3x3 'same')
+        # padding debe ser entero (ej: 1 para 3x3 'same')
         layers.append(nn.Conv2d(in_c, out_c, kernel_size, stride=strides, padding=padding))
         
         if batch_normalization:
@@ -71,7 +71,7 @@ class AutoEncoderDown3(nn.Module):
         super().__init__()
         p = params
         
-        # --- ENCODER ---
+        # ENCODER
         # Camino Convolucional (Conv 1 -> Conv 2)
         self.conv_layer_1 = AdjConv2D(p['in_c'], **p['Conv2DParams1'])
         self.conv_layer_2 = AdjConv2D(p['Conv2DParams1']['out_c'], **p['Conv2DParams2'])
@@ -84,7 +84,7 @@ class AutoEncoderDown3(nn.Module):
         # La entrada aquí debe ser la suma de conv_layer_2 y pass_through_2
         self.conv_layer_3 = AdjConv2D(p['Conv2DParams2']['out_c'], **p['Conv2DParams3'])
 
-        # --- DECODER ---
+        # DECODER 
         # Procesamiento del latente
         self.trans_conv_3 = AdjConv2DTranspose(p['Conv2DParams3']['out_c'], **p['Conv2DTransposeParams3'])
         self.trans_conv_2 = AdjConv2DTranspose(p['Conv2DTransposeParams3']['out_c'], **p['Conv2DTransposeParams2'])
@@ -97,7 +97,7 @@ class AutoEncoderDown3(nn.Module):
         self.trans_conv_1 = AdjConv2DTranspose(p['MixParams']['out_c'], **p['Conv2DTransposeParams1'])
 
     def forward(self, x):
-        # 1. Encoder
+        # Encoder
         c1_out = self.conv_layer_1(x) # Este es nuestro 'skip_out'
         c2_out = self.conv_layer_2(c1_out)
         
@@ -108,7 +108,7 @@ class AutoEncoderDown3(nn.Module):
         sum_enc = c2_out + p2_out 
         latent = self.conv_layer_3(sum_enc)
         
-        # 2. Decoder
+        # Decoder
         d3_out = self.trans_conv_3(latent)
         d2_out = self.trans_conv_2(d3_out)
         
@@ -119,7 +119,6 @@ class AutoEncoderDown3(nn.Module):
         reconstruction = self.trans_conv_1(mixed)
         
         return reconstruction, latent
-
 
 
 ## definimos aca el latentNCA
@@ -146,11 +145,11 @@ class LatentNCA(nn.Module):
 
     def forward(self, x, steps=10):
         for _ in range(steps):
-            # 1. Percibir vecinos
+            # Percibir vecinos
             perceived = self.perception(x)
-            # 2. Calcular delta (cambio)
+            # Calcular cambio
             delta = self.update_rule(perceived)
-            # 3. Aplicar actualización estocástica (estilo NCA original)
+            # Aplicar actualización estocástica
             # Solo algunas células se actualizan en cada paso para fomentar robustez
             mask = (torch.rand(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device) > 0.5).float()
             x = x + delta * mask
@@ -161,17 +160,18 @@ class LatentNCA(nn.Module):
 class NCASegmenter(nn.Module):
     def __init__(self, ae_params, nca_steps=8):
         super().__init__()
-        # Instanciamos tu modelo original
+
+        # Instanciamos el autoencoder
         self.ae = AutoEncoderDown3(ae_params)
         self.nca_steps = nca_steps
         
-        # El NCA opera sobre los canales del espacio latente (256 según tus params[cite: 1])
+        # El NCA opera sobre los canales del espacio latente 
         latent_channels = ae_params['Conv2DParams3']['out_c']
         self.nca = LatentNCA(channels=latent_channels)
 
     def forward(self, x):
-        # --- PASO 1: ENCODER ---
-        # Ejecutamos las capas de tu encoder manualmente para guardar el 'skip_out'[cite: 1]
+        # PASO 1: encoder
+        # Ejecutamos las capas de tu encoder manualmente para guardar el 'skip_out'
         c1_out = self.ae.conv_layer_1(x) # Este es el skip que necesita el decoder final
         c2_out = self.ae.conv_layer_2(c1_out)
         
@@ -181,12 +181,12 @@ class NCASegmenter(nn.Module):
         sum_enc = c2_out + p2_out 
         latent = self.ae.conv_layer_3(sum_enc)
         
-        # --- PASO 2: EVOLUCIÓN NCA ---
+        # PASO 2: EVOLUCIÓN NCA
         # El NCA refina el espacio latente
         latent_evolved = self.nca(latent, steps=self.nca_steps)
         
-        # --- PASO 3: DECODER ---
-        # Usamos las capas del decoder de tu modelo original[cite: 1]
+        # PASO 3: DECODER
+        # ejectuamos las capas del decoder manualmente para inyectar el skip connection
         d3_out = self.ae.trans_conv_3(latent_evolved)
         d2_out = self.ae.trans_conv_2(d3_out)
         
@@ -199,8 +199,42 @@ class NCASegmenter(nn.Module):
         return reconstruction, latent_evolved
 
 
-## funcion de referencia para entrenar el modelo entrenado de forma entera
 
+## funcion referencia para entrenar autoencoder 
+def train_ae(model, train_loader, epochs=10, device='cuda'):
+    # congelamos el NCA
+    for param in model.nca.parameters():
+        param.requires_grad = False
+        
+    optimizer = optim.Adam(model.ae.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss() 
+    
+    model.to(device)
+    
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+        
+        for imgs, masks in train_loader:  # No necesitamos las máscaras para el AE
+            imgs = imgs.to(device)
+            masks = masks.to(device) # Debe ser (N, H, W) con valores {0, 1, 2}
+            
+            optimizer.zero_grad()
+            
+            # Forward: Obtenemos la reconstrucción
+            outputs, _ = model.ae(imgs)
+            
+            loss = criterion(outputs, masks)  # Queremos que la salida se parezca a la entrada
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            
+        print(f"Época [{epoch+1}/{epochs}] - Loss: {total_loss/len(train_loader):.4f}")
+
+
+
+## funcion de referencia para entrenar el modelo entrenado de forma entera
 def train_nca(model, train_loader, epochs=10, device='cuda'):
     # CONGELAMOS EL AUTOENCODER[cite: 1]
     # Solo queremos que aprenda la "regla de actualización" del NCA
