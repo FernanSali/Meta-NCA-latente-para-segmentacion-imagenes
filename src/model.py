@@ -123,7 +123,7 @@ class AutoEncoderDown3(nn.Module):
 
 ## definimos aca el latentNCA
 class LatentNCA(nn.Module):
-    def __init__(self, channels=16, hidden_dims=128):
+    def __init__(self, channels=16, hidden_dims=64):
         super().__init__()
         self.channels = channels
         
@@ -158,7 +158,7 @@ class LatentNCA(nn.Module):
 
 ## integramos el autoencoder con el NCA en un modelo 
 class NCASegmenter(nn.Module):
-    def __init__(self, ae_params, nca_steps=8):
+    def __init__(self, ae_params, nca_steps=32):
         super().__init__()
 
         # Instanciamos el autoencoder
@@ -236,7 +236,7 @@ def train_ae(model, train_loader, epochs=10, device='cuda'):
 
 ## funcion de referencia para entrenar el modelo entrenado de forma entera
 def train_nca(model, train_loader, epochs=10, device='cuda'):
-    # CONGELAMOS EL AUTOENCODER[cite: 1]
+    # CONGELAMOS EL AUTOENCODER
     # Solo queremos que aprenda la "regla de actualización" del NCA
     for param in model.ae.parameters():
         param.requires_grad = False
