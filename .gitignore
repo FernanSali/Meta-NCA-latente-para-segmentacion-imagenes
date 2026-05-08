@@ -43,3 +43,4 @@ wheels/
 *.log
 *.toc
 *.pdf
+*.pth
