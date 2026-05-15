@@ -108,6 +108,8 @@ class AutoEncoderDown3(nn.Module):
         sum_enc = c2_out + p2_out 
         latent = self.conv_layer_3(sum_enc)
         
+        ## usar latent pa parameter predictor en un futuro
+        
         # Decoder
         d3_out = self.trans_conv_3(latent)
         d2_out = self.trans_conv_2(d3_out)
@@ -121,7 +123,7 @@ class AutoEncoderDown3(nn.Module):
         return reconstruction, latent
 
 
-## definimos aca el latentNCA
+## definimos aca el latentNCA, este es preliminar para probar
 class LatentNCA(nn.Module):
     def __init__(self, channels=16, hidden_dims=64):
         super().__init__()
@@ -136,9 +138,9 @@ class LatentNCA(nn.Module):
         self.update_rule = nn.Sequential(
             nn.Conv2d(channels * 3, hidden_dims, kernel_size=1),
             nn.ReLU(),
-            nn.Conv2d(hidden_dims, channels, kernel_size=1)
-        )
-        
+            nn.Conv2d(hidden_dims, channels, kernel_size=1) #, bias=False?
+        )     
+           
         # Inicialización: Empezamos con actualizaciones casi nulas para estabilidad
         nn.init.zeros_(self.update_rule[-1].weight)
         nn.init.zeros_(self.update_rule[-1].bias)
@@ -154,8 +156,8 @@ class LatentNCA(nn.Module):
             mask = (torch.rand(x.shape[0], 1, x.shape[2], x.shape[3], device=x.device) > 0.5).float()
             x = x + delta * mask
         return x
+ 
     
-
 ## integramos el autoencoder con el NCA en un modelo 
 class NCASegmenter(nn.Module):
     def __init__(self, ae_params, nca_steps=32):
@@ -184,6 +186,182 @@ class NCASegmenter(nn.Module):
         # PASO 2: EVOLUCIÓN NCA
         # El NCA refina el espacio latente
         latent_evolved = self.nca(latent, steps=self.nca_steps)
+        
+        # PASO 3: DECODER
+        # ejectuamos las capas del decoder manualmente para inyectar el skip connection
+        d3_out = self.ae.trans_conv_3(latent_evolved)
+        d2_out = self.ae.trans_conv_2(d3_out)
+        
+        # Reinyectamos el skip connection guardado en el paso 1
+        sum_dec = d2_out + c1_out 
+        
+        mixed = self.ae.mix_layer(sum_dec)
+        reconstruction = self.ae.trans_conv_1(mixed)
+        
+        return reconstruction, latent_evolved
+    
+## definimos aca el dynamic latent nca con parametros que se dan, no entrenable  
+
+## funcion para obtener filtros sobel para la percepción del NCA, esto es fijo y no entrenabl  
+def get_sobel_kernel(channels):
+    # Filtro Sobel X
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+    # Filtro Sobel Y
+    sobel_y = sobel_x.t()
+    # Identidad
+    identity = torch.tensor([[0, 0, 0], [0, 1, 0], [0, 0, 0]], dtype=torch.float32)
+    
+    # Combinamos y expandimos para procesar todos los canales (Depthwise)
+    kernels = torch.stack([sobel_x, sobel_y, identity]) # Shape: (3, 3, 3)
+    # Replicamos para cada canal de entrada
+    kernels = kernels.unsqueeze(1).repeat(channels, 1, 1, 1) # Shape: (C*3, 1, 3, 3)
+    return kernels
+
+import torch.nn.functional as F
+
+class DynamicLatentNCA(nn.Module):
+    def __init__(self, channels=16, hidden_dims=64):
+        super().__init__()
+        self.channels = channels
+        self.hidden_dims = hidden_dims
+        
+        # Percepción: Filtros Sobel fijos (no entrenables), register_buffer crea un tensor que no es un parámetro entrenable pero se mueve con el modelo (ej: a GPU)
+        self.register_buffer('sobel_kernel', get_sobel_kernel(channels))
+        
+        # Normalización: Crucial para evitar que ReLU explote en la recurrencia
+        self.norm = nn.InstanceNorm2d(channels * 3)
+        
+        # Único parámetro entrenable interno del NCA según el paper
+        self.leak_factor = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, weights, steps=32):
+        '''
+    x: Tensor latente (B, C, H, W)
+    weights: (w1_batch, b1_batch, w2_batch, b2_batch)
+        '''    
+        
+        w1, b1, w2, b2 = weights
+        B, C, H, W = x.shape
+        H_dims = self.hidden_dims
+
+        # Preparamos los pesos para la convolución agrupada
+        # w1: [B, H_dims, C*3, 1, 1] -> [B*H_dims, C*3, 1, 1]
+        w1 = w1.view(B * H_dims, C * 3, 1, 1)
+        b1 = b1.view(B * H_dims)
+        
+        # w2: [B, C, H_dims, 1, 1] -> [B*C, H_dims, 1, 1]
+        w2 = w2.view(B * C, H_dims, 1, 1)
+        b2 = b2.view(B * C)
+
+        for _ in range(steps):
+            # 1. PERCEPCIÓN (Sobel)
+            # Sigue siendo eficiente ya que usa groups=C 
+            perceived = F.conv2d(x, self.sobel_kernel, padding=1, groups=C)
+            perceived = self.norm(perceived) 
+
+            # 2. UPDATE RULE (Dynamic Grouped Convolutions)
+            # Paso A: Aplanamos el batch dentro de los canales para procesar todo junto
+            # input: [1, B*(C*3), H, W]
+            input_parallel = perceived.view(1, B * (C * 3), H, W)
+            
+            # Capa 1: Aplicamos B grupos. Cada grupo usa su propio set de pesos w1 
+            dx = F.conv2d(input_parallel, weight=w1, bias=b1, groups=B)
+            dx = F.relu(dx) # [1, B*H_dims, H, W]
+            
+            # Capa 2: Aplicamos B grupos de nuevo para volver a los canales originales 
+            dx = F.conv2d(dx, weight=w2, bias=b2, groups=B)
+            
+            # Recomponemos el shape original [B, C, H, W]
+            dx = dx.view(B, C, H, W)
+
+            # 3. MORFOGÉNESIS
+            # Aplicamos la actualización estocástica y el Leak Factor 
+            mask = (torch.rand(B, 1, H, W, device=x.device) > 0.5).float()
+            x = x + (self.leak_factor * dx * mask) 
+            
+        return x
+    
+## hacemos el parameter predictor  
+class ParameterPredictor(nn.Module):
+    def __init__(self, latent_dim, h_nca, out_nca):
+        super().__init__()
+        self.h_nca = h_nca
+        self.out_nca = out_nca
+        
+        # Estas formas representan UN solo set de pesos
+        self.w1_size = h_nca * (out_nca * 3) * 1 * 1
+        self.b1_size = h_nca
+        self.w2_size = out_nca * h_nca * 1 * 1
+        self.b2_size = out_nca
+        
+        total_params = self.w1_size + self.b1_size + self.w2_size + self.b2_size
+        
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, total_params)
+        )
+
+    def forward(self, e):
+        # e: [Batch, latent_dim]
+        p = self.net(e) 
+        batch_size = p.shape[0]
+        idx = 0
+        
+        # Extraemos y reformateamos manteniendo la dimensión del batch al principio
+        # Pesos 1: [B, hidden, in*3, 1, 1]
+        w1 = p[:, idx:idx + self.w1_size].view(batch_size, self.h_nca, self.out_nca * 3, 1, 1)
+        idx += self.w1_size
+        
+        # Bias 1: [B, hidden]
+        b1 = p[:, idx:idx + self.b1_size].view(batch_size, self.h_nca)
+        idx += self.b1_size
+        
+        # Pesos 2: [B, out, hidden, 1, 1]
+        w2 = p[:, idx:idx + self.w2_size].view(batch_size, self.out_nca, self.h_nca, 1, 1)
+        idx += self.w2_size
+        
+        # Bias 2: [B, out]
+        b2 = p[:, idx:idx + self.b2_size].view(batch_size, self.out_nca)
+        
+        return (w1, b1, w2, b2)
+    
+
+    
+## integramos el autoencoder con el dynamic NCA en un modelo 
+class MetaNCASegmenter(nn.Module):
+    def __init__(self, ae_params, nca_steps=32):
+        super().__init__()
+
+        # Instanciamos el autoencoder
+        self.ae = AutoEncoderDown3(ae_params)
+        self.nca_steps = nca_steps
+        
+        # El NCA opera sobre los canales del espacio latente 
+        latent_channels = ae_params['Conv2DParams3']['out_c']
+        self.nca = DynamicLatentNCA(channels=latent_channels)
+
+        # instanciamos el parameter predictor
+        self.param_predictor = ParameterPredictor(latent_dim=latent_channels, h_nca=self.nca.hidden_dims, out_nca=latent_channels)
+
+    def forward(self, x):
+        # PASO 1: encoder
+        # Ejecutamos las capas de tu encoder manualmente para guardar el 'skip_out'
+        c1_out = self.ae.conv_layer_1(x) # Este es el skip que necesita el decoder final
+        c2_out = self.ae.conv_layer_2(c1_out)
+        
+        p1_out = self.ae.pass_through_1(x)
+        p2_out = self.ae.pass_through_2(p1_out)
+        
+        sum_enc = c2_out + p2_out 
+        latent = self.ae.conv_layer_3(sum_enc)
+
+        ## obtenemos los pesos dinámicos para el NCA a partir del espacio latente
+        dynamic_weights = self.param_predictor(latent.mean(dim=[2,3]))  # Global Average Pooling para obtener un vector por muestra
+        
+        # PASO 2: EVOLUCIÓN NCA
+        # El NCA refina el espacio latente
+        latent_evolved = self.nca(latent, weights=dynamic_weights ,steps=self.nca_steps)
         
         # PASO 3: DECODER
         # ejectuamos las capas del decoder manualmente para inyectar el skip connection
@@ -232,7 +410,23 @@ def train_ae(model, train_loader, epochs=10, device='cuda'):
             
         print(f"Época [{epoch+1}/{epochs}] - Loss: {total_loss/len(train_loader):.4f}")
 
+## crearemos un pool de entrenamiento para la estabilidad
 
+class NCAPool:
+    def __init__(self, pool_size, channels, h, w, device):
+        # El pool guarda el estado latente completo (N, C, H, W) 
+        self.size = pool_size
+        self.pool = torch.zeros(pool_size, channels, h, w).to(device)
+        self.device = device
+
+    def sample(self, batch_size):
+        # Seleccionamos índices al azar para el entrenamiento
+        idx = torch.randint(0, self.size, (batch_size,))
+        return self.pool[idx], idx
+
+    def update(self, idx, new_states):
+        # Guardamos los estados evolucionados de vuelta en el buffer 
+        self.pool[idx] = new_states.detach()
 
 ## funcion de referencia para entrenar el modelo entrenado de forma entera
 def train_nca(model, train_loader, epochs=10, device='cuda'):

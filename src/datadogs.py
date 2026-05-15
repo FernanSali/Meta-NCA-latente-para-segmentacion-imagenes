@@ -32,7 +32,6 @@ pet_data_train = datasets.OxfordIIITPet(root="data", split="trainval", target_ty
 pet_data_test = datasets.OxfordIIITPet(root="data", split="test", target_types="segmentation" ,download=True, transform=img_transform, target_transform=target_transform)
 
 
-
 ## dataloader
 batch_size = 4 # Ajusta según tu memoria de video (VRAM)
 
@@ -162,6 +161,25 @@ def comparar_modelos(model1, model2, test_loader, device, num_images=3):
     plt.show()
 
 
+def calculo_perdida(model, test_loader, device):
+    # --- Cálculo de Loss en Test Set ---
+    model.eval()
+    test_loss = 0.0
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images, masks = images.to(device), masks.to(device)
+            
+            # Obtenemos logits del modelo (ignoramos el espacio latente _)
+            logits, _ = model(images)
+            
+            loss = criterion(logits, masks)
+            test_loss += loss.item()
+
+    avg_test_loss = test_loss / len(test_loader)
+    print(f"\n[EVAL] Loss promedio en Test Loader: {avg_test_loss:.4f}")
+
 if __name__ == "__main__":
 
     # Verificar que los datos se cargan correctamente
@@ -217,5 +235,7 @@ if __name__ == "__main__":
     nca_entero = NCASegmenter(ae_params=params, nca_steps=16).to(device)
 
     nca_entero.load_state_dict(torch.load("nca_entero4.pth", map_location=device))
+
+    #calculo_perdida(nca_entero, test_loader, device)
 
     comparar_modelos(nca_entero.ae, nca_entero, test_loader, device, num_images=3)
