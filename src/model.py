@@ -401,7 +401,7 @@ class NCAPool:
         # Guardamos los estados evolucionados de vuelta en el buffer 
         self.pool[idx] = new_states.detach()
 
-## funcion de referencia para entrenar el modelo entrenado de forma entera
+## funcion de referencia para entrenar el modelo entrenado de forma entera, este el nca normal
 def train_nca(model, train_loader, epochs=10, device='cuda'):
     # CONGELAMOS EL AUTOENCODER
     # Solo queremos que aprenda la "regla de actualización" del NCA
@@ -433,3 +433,70 @@ def train_nca(model, train_loader, epochs=10, device='cuda'):
             total_loss += loss.item()
             
         print(f"Época [{epoch+1}/{epochs}] - Loss: {total_loss/len(train_loader):.4f}")
+
+## funcion entrenamiento preliminar para entrenar meta nca  (la fase 2, entrenar el nca dinamico, es decir el predictor de parametros)
+
+def train_meta_nca(model, train_loader, device='cuda'):
+    '''entrenamiento metaNCA, 1 epoch'''
+    ## entrenamiento metaNCA segmenter
+    print(" Congelando parámetros del Autoencoder...")
+    for param in model.ae.parameters():
+        param.requires_grad = False
+        param.grad = None  # Forzamos la eliminación de cualquier gradiente residual de la Fase 1
+
+    # Aseguramos que el Predictor y el NCA sí calculen gradientes
+    for param in model.param_predictor.parameters():
+        param.requires_grad = True
+    model.nca.leak_factor.requires_grad = True
+
+
+    # Pasamos única y exclusivamente los parámetros que requieren gradiente
+    # Esto evita que Adam aplique updates o momentum en los tensores congelados
+    optimizer = optim.Adam([
+        {'params': [p for p in model.nca.parameters() if p.requires_grad]},
+        {'params': [p for p in model.param_predictor.parameters() if p.requires_grad]}
+    ], lr=1e-3)
+
+    criterion = nn.CrossEntropyLoss()
+    model.to(device)
+
+    model.train()  # Activa modo entrenamiento general para el predictor
+    model.ae.eval() # Fuerza al Autoencoder a mantenerse estático
+
+    # Blindaje extra: Reemplazamos temporalmente el método train del AE 
+    # para que ninguna llamada accidental en el loop altere sus sub-capas
+    def dezafectar_train(mode=True):
+        for module in model.ae.modules():
+            if isinstance(module, (nn.BatchNorm2d, nn.Dropout2d)):
+                module.eval()
+    model.ae.train = dezafectar_train
+    dezafectar_train()
+
+
+    total_loss = 0
+    print(" Iniciando loop de prueba preliminar blindado...")
+
+    for i, (imgs, masks) in enumerate(train_loader):
+        imgs, masks = imgs.to(device), masks.to(device)
+        
+        # set_to_none=True elimina los gradientes del optimizador liberando VRAM
+        optimizer.zero_grad(set_to_none=True)
+        
+        # Forward: Obtención de la salida a través del meta-NCA latente
+        outputs, _ = model(imgs)
+        
+        loss = criterion(outputs, masks)
+        loss.backward()
+        optimizer.step()
+        
+        # Restricción matemática de estabilidad del autómata celular
+        with torch.no_grad():
+            model.nca.leak_factor.clamp_(1e-3, 1e3)
+        
+        total_loss += loss.item()
+
+        if (i + 1) % 100 == 0:
+            print(f"\n✅ Van {i + 1} batches procesados exitosamente.")
+            print(f"📊 Loss promedio actual: {total_loss / (i + 1):.4f}")
+            print(f"💧 Leak Factor actual: {model.nca.leak_factor.item():.4f}")
+        
