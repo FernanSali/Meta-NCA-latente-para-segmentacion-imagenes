@@ -200,6 +200,7 @@ class NCASegmenter(nn.Module):
         
         return reconstruction, latent_evolved
     
+
 ## definimos aca el dynamic latent nca con parametros que se dan, no entrenable  
 
 ## funcion para obtener filtros sobel para la percepción del NCA, esto es fijo y no entrenabl  
@@ -220,63 +221,49 @@ def get_sobel_kernel(channels):
 import torch.nn.functional as F
 
 class DynamicLatentNCA(nn.Module):
+
     def __init__(self, channels=16, hidden_dims=64):
         super().__init__()
         self.channels = channels
         self.hidden_dims = hidden_dims
         
-        # Percepción: Filtros Sobel fijos (no entrenables), register_buffer crea un tensor que no es un parámetro entrenable pero se mueve con el modelo (ej: a GPU)
         self.register_buffer('sobel_kernel', get_sobel_kernel(channels))
         
-        # Normalización: Crucial para evitar que ReLU explote en la recurrencia
-        self.norm = nn.InstanceNorm2d(channels * 3)
-        
-        # Único parámetro entrenable interno del NCA según el paper
+        # Ajustamos a channels * 3 para acoplar la percepción Sobel
+        self.norm = nn.InstanceNorm2d(channels * 3, affine=False)
         self.leak_factor = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x, weights, steps=32):
         '''
-    x: Tensor latente (B, C, H, W)
-    weights: (w1_batch, b1_batch, w2_batch, b2_batch)
+        x: Tensor latente (B, C, H, W) 
+        weights: Tupla (w1, b1, w2, b2) generada por el ParameterPredictor 
         '''    
-        
         w1, b1, w2, b2 = weights
         B, C, H, W = x.shape
-        H_dims = self.hidden_dims
-
-        # Preparamos los pesos para la convolución agrupada
-        # w1: [B, H_dims, C*3, 1, 1] -> [B*H_dims, C*3, 1, 1]
-        w1 = w1.view(B * H_dims, C * 3, 1, 1)
-        b1 = b1.view(B * H_dims)
-        
-        # w2: [B, C, H_dims, 1, 1] -> [B*C, H_dims, 1, 1]
-        w2 = w2.view(B * C, H_dims, 1, 1)
-        b2 = b2.view(B * C)
 
         for _ in range(steps):
-            # 1. PERCEPCIÓN (Sobel)
-            # Sigue siendo eficiente ya que usa groups=C 
+            # 1. PERCEPCIÓN (Sobel + InstanceNorm para cortar la explosión recurrente) 
             perceived = F.conv2d(x, self.sobel_kernel, padding=1, groups=C)
             perceived = self.norm(perceived) 
 
-            # 2. UPDATE RULE (Dynamic Grouped Convolutions)
-            # Paso A: Aplanamos el batch dentro de los canales para procesar todo junto
-            # input: [1, B*(C*3), H, W]
-            input_parallel = perceived.view(1, B * (C * 3), H, W)
+            # 2. UPDATE RULE (Convolución dinámica funcional 1x1 limpia por muestra) 
+            dx_list = []
+            for b in range(B):
+                # Procesamos muestra por muestra para mantener el grafo de gradientes ligero
+                # perceived[b:b+1] -> (1, C*3, H, W)
+                # w1[b] -> (H_dims, C*3, 1, 1) | b1[b] -> (H_dims)
+                out_layer1 = F.conv2d(perceived[b:b+1], weight=w1[b], bias=b1[b], stride=1, padding=0)
+                out_layer1 = F.relu(out_layer1) 
+                
+                # w2[b] -> (C, H_dims, 1, 1) | b2[b] -> (C)
+                out_layer2 = F.conv2d(out_layer1, weight=w2[b], bias=b2[b], stride=1, padding=0)
+                dx_list.append(out_layer2)
             
-            # Capa 1: Aplicamos B grupos. Cada grupo usa su propio set de pesos w1 
-            dx = F.conv2d(input_parallel, weight=w1, bias=b1, groups=B)
-            dx = F.relu(dx) # [1, B*H_dims, H, W]
-            
-            # Capa 2: Aplicamos B grupos de nuevo para volver a los canales originales 
-            dx = F.conv2d(dx, weight=w2, bias=b2, groups=B)
-            
-            # Recomponemos el shape original [B, C, H, W]
-            dx = dx.view(B, C, H, W)
+            # Unimos el lote de nuevo sin romper la memoria interna
+            dx = torch.cat(dx_list, dim=0)
 
-            # 3. MORFOGÉNESIS
-            # Aplicamos la actualización estocástica y el Leak Factor 
-            mask = (torch.rand(B, 1, H, W, device=x.device) > 0.5).float()
+            # 3. MORFOGÉNESIS (Actualización estocástica) 
+            mask = (torch.rand(B, 1, H, W, device=x.device) > 0.5).float() 
             x = x + (self.leak_factor * dx * mask) 
             
         return x
@@ -288,7 +275,6 @@ class ParameterPredictor(nn.Module):
         self.h_nca = h_nca
         self.out_nca = out_nca
         
-        # Estas formas representan UN solo set de pesos
         self.w1_size = h_nca * (out_nca * 3) * 1 * 1
         self.b1_size = h_nca
         self.w2_size = out_nca * h_nca * 1 * 1
@@ -297,32 +283,27 @@ class ParameterPredictor(nn.Module):
         total_params = self.w1_size + self.b1_size + self.w2_size + self.b2_size
         
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, 256),
+            nn.Linear(latent_dim, 128),
             nn.ReLU(),
-            nn.Linear(256, total_params)
+            nn.Linear(128, total_params)
         )
 
     def forward(self, e):
-        # e: [Batch, latent_dim]
+        # e: [Batch, latent_dim] 
         p = self.net(e) 
         batch_size = p.shape[0]
-        idx = 0
         
-        # Extraemos y reformateamos manteniendo la dimensión del batch al principio
-        # Pesos 1: [B, hidden, in*3, 1, 1]
-        w1 = p[:, idx:idx + self.w1_size].view(batch_size, self.h_nca, self.out_nca * 3, 1, 1)
-        idx += self.w1_size
+        # Desempaquetamos de forma nativa manteniendo la separación del lote desde el inicio
+        w1 = p[:, :self.w1_size].contiguous().view(batch_size, self.h_nca, self.out_nca * 3, 1, 1)
+        idx = self.w1_size
         
-        # Bias 1: [B, hidden]
-        b1 = p[:, idx:idx + self.b1_size].view(batch_size, self.h_nca)
+        b1 = p[:, idx:idx + self.b1_size].contiguous().view(batch_size, self.h_nca)
         idx += self.b1_size
         
-        # Pesos 2: [B, out, hidden, 1, 1]
-        w2 = p[:, idx:idx + self.w2_size].view(batch_size, self.out_nca, self.h_nca, 1, 1)
+        w2 = p[:, idx:idx + self.w2_size].contiguous().view(batch_size, self.out_nca, self.h_nca, 1, 1)
         idx += self.w2_size
         
-        # Bias 2: [B, out]
-        b2 = p[:, idx:idx + self.b2_size].view(batch_size, self.out_nca)
+        b2 = p[:, idx:].contiguous().view(batch_size, self.out_nca)
         
         return (w1, b1, w2, b2)
     
@@ -332,45 +313,37 @@ class ParameterPredictor(nn.Module):
 class MetaNCASegmenter(nn.Module):
     def __init__(self, ae_params, nca_steps=32):
         super().__init__()
-
-        # Instanciamos el autoencoder
         self.ae = AutoEncoderDown3(ae_params)
         self.nca_steps = nca_steps
         
-        # El NCA opera sobre los canales del espacio latente 
         latent_channels = ae_params['Conv2DParams3']['out_c']
         self.nca = DynamicLatentNCA(channels=latent_channels)
-
-        # instanciamos el parameter predictor
         self.param_predictor = ParameterPredictor(latent_dim=latent_channels, h_nca=self.nca.hidden_dims, out_nca=latent_channels)
 
-    def forward(self, x):
-        # PASO 1: encoder
-        # Ejecutamos las capas de tu encoder manualmente para guardar el 'skip_out'
-        c1_out = self.ae.conv_layer_1(x) # Este es el skip que necesita el decoder final
-        c2_out = self.ae.conv_layer_2(c1_out)
+    def forward(self, x, steps=None):
+        current_steps = steps if steps is not None else self.nca_steps
         
+        # PASO 1: Encoder 
+        c1_out = self.ae.conv_layer_1(x) 
+        c2_out = self.ae.conv_layer_2(c1_out)
         p1_out = self.ae.pass_through_1(x)
         p2_out = self.ae.pass_through_2(p1_out)
         
         sum_enc = c2_out + p2_out 
         latent = self.ae.conv_layer_3(sum_enc)
 
-        ## obtenemos los pesos dinámicos para el NCA a partir del espacio latente
-        dynamic_weights = self.param_predictor(latent.mean(dim=[2,3]))  # Global Average Pooling para obtener un vector por muestra
+        # Global Average Pooling para alimentar al predictor 
+        latent_vector = latent.mean(dim=[2, 3]) 
+        dynamic_weights = self.param_predictor(latent_vector) 
         
-        # PASO 2: EVOLUCIÓN NCA
-        # El NCA refina el espacio latente
-        latent_evolved = self.nca(latent, weights=dynamic_weights ,steps=self.nca_steps)
+        # PASO 2: Evolución NCA en el espacio latente 
+        latent_evolved = self.nca(latent, weights=dynamic_weights, steps=current_steps)
         
-        # PASO 3: DECODER
-        # ejectuamos las capas del decoder manualmente para inyectar el skip connection
+        # PASO 3: Decoder 
         d3_out = self.ae.trans_conv_3(latent_evolved)
         d2_out = self.ae.trans_conv_2(d3_out)
         
-        # Reinyectamos el skip connection guardado en el paso 1
         sum_dec = d2_out + c1_out 
-        
         mixed = self.ae.mix_layer(sum_dec)
         reconstruction = self.ae.trans_conv_1(mixed)
         
