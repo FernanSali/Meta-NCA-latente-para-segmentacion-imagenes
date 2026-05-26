@@ -33,9 +33,9 @@ pet_data_test = datasets.OxfordIIITPet(root="data", split="test", target_types="
 
 
 ## dataloader
-batch_size = 4 # Ajusta según tu memoria de video (VRAM)
+batch_size = 8 # Ajusta según tu memoria de video (VRAM)
 
-train_loader = DataLoader(
+dog_train_loader = DataLoader(
     pet_data_train, 
     batch_size=batch_size, 
     shuffle=True,      
@@ -44,7 +44,7 @@ train_loader = DataLoader(
 )
 
 
-test_loader = DataLoader(
+dog_test_loader = DataLoader(
     pet_data_test, 
     batch_size=batch_size, 
     shuffle=True,      
@@ -52,113 +52,6 @@ test_loader = DataLoader(
     #pin_memory=True    # Mejora velocidad de transferencia a GPU
 )
 
-## Funcion para probar modelo IA y ver resultados
-def probar_modelo(model, test_loader, device, num_images=3):
-    model.eval()
-    images, masks = next(iter(test_loader)) # Tomamos un batch del test_loader
-
-    criterion = nn.CrossEntropyLoss() 
-    
-    # Movemos al device
-    images = images.to(device)
-    masks = masks.to(device)
-    
-    with torch.no_grad(): # Desactiva el cálculo de gradientes (ahorra memoria)
-        # Tu modelo devuelve (reconstruction, latent)
-        logits, _ = model(images)
-        
-        # Los logits tienen forma (Batch, 3, H, W). 
-        # Aplicamos argmax en la dimensión de canales (1) para obtener la clase [0, 1, 2]
-        preds = torch.argmax(logits, dim=1)
-
-        loss = criterion(logits, masks).item()
-        print(f"Loss en el batch de prueba: {loss:.4f}")
-
-    # Visualización
-    fig, axes = plt.subplots(num_images, 3, figsize=(12, num_images * 4))
-    
-    for i in range(num_images):
-        # 1. Imagen Original (revertir normalización si la usaste)
-        img_vis = images[i].cpu().permute(1, 2, 0).numpy()
-        axes[i, 0].imshow(img_vis)
-        axes[i, 0].set_title("Imagen Original")
-        axes[i, 0].axis("off")
-        
-        # 2. Máscara Real (Ground Truth)
-        axes[i, 1].imshow(masks[i].cpu().numpy(), cmap='viridis')
-        axes[i, 1].set_title("Máscara Real")
-        axes[i, 1].axis("off")
-        
-        # 3. Predicción del Modelo
-        axes[i, 2].imshow(preds[i].cpu().numpy(), cmap='viridis')
-        axes[i, 2].set_title("Predicción AI")
-        axes[i, 2].axis("off")
-
-
-    plt.tight_layout()
-    plt.show()
-
-
-## Funcion para ver el nca, ve la pare encoding decoding sin el nca y con el nca implementado
-def comparar_modelos(model1, model2, test_loader, device, num_images=3):
-    # 1. Definir el criterio de pérdida (debe ser el mismo usado en el entrenamiento)
-    criterion = nn.CrossEntropyLoss()
-    
-    model1.eval()
-    model2.eval()
-    
-    # Tomamos un batch del test_loader
-    images, masks = next(iter(test_loader)) 
-    
-    # Movemos al device
-    images = images.to(device)
-    masks = masks.to(device)
-    
-    with torch.no_grad(): 
-        # Inferencia de ambos modelos
-        # Recordar que ambos devuelven (reconstruction, latent)
-        logits1, _ = model1(images)
-        logits2, _ = model2(images)
-
-        # 2. Calcular la pérdida específica de este batch para cada modelo
-        loss1 = criterion(logits1, masks).item()
-        loss2 = criterion(logits2, masks).item()
-
-        # Obtener las clases [0, 1, 2] con argmax
-        preds1 = torch.argmax(logits1, dim=1)
-        preds2 = torch.argmax(logits2, dim=1)
-
-    # Visualización
-    fig, axes = plt.subplots(num_images, 4, figsize=(18, num_images * 4))
-    
-    # Añadimos un título general con las pérdidas promedio del batch
-    fig.suptitle(f'Comparación de Desempeño\nLoss AE Base: {loss1:.4f} | Loss con NCA: {loss2:.4f}', 
-                 fontsize=16, fontweight='bold')
-
-    for i in range(num_images):
-        # 1. Imagen Original
-        img_vis = images[i].cpu().permute(1, 2, 0).numpy()
-        axes[i, 0].imshow(img_vis)
-        axes[i, 0].set_title("Imagen Original")
-        axes[i, 0].axis("off")
-        
-        # 2. Máscara Real (Ground Truth)
-        axes[i, 1].imshow(masks[i].cpu().numpy(), cmap='viridis')
-        axes[i, 1].set_title("Máscara Real")
-        axes[i, 1].axis("off")
-        
-        # 3. Predicción Encoder-Decoder
-        axes[i, 2].imshow(preds1[i].cpu().numpy(), cmap='viridis')
-        axes[i, 2].set_title(f"AE Base")
-        axes[i, 2].axis("off")
-
-        # 4. Predicción con NCA 
-        axes[i, 3].imshow(preds2[i].cpu().numpy(), cmap='viridis')
-        axes[i, 3].set_title(f"AE + NCA")
-        axes[i, 3].axis("off")
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Ajuste para que no se solape el suptitle
-    plt.show()
 
 
 def calculo_perdida(model, test_loader, device):
@@ -183,7 +76,7 @@ def calculo_perdida(model, test_loader, device):
 if __name__ == "__main__":
 
     # Verificar que los datos se cargan correctamente
-    for images, masks in train_loader:
+    for images, masks in dog_train_loader:
         print(f"Batch de imágenes: {images.shape}")  # Debería ser [batch_size, 3, 256, 256]
         print(f"Batch de máscaras: {masks.shape}")   # Debería ser [batch_size, 256, 256]
         break  # Solo verificar el primer batch
@@ -238,4 +131,4 @@ if __name__ == "__main__":
 
     #calculo_perdida(nca_entero, test_loader, device)
 
-    comparar_modelos(nca_entero.ae, nca_entero, test_loader, device, num_images=3)
+    comparar_modelos(nca_entero.ae, nca_entero, dog_test_loader, device, num_images=3)
