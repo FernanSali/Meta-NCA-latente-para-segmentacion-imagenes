@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+from src.train import MulticlassDiceLoss, SpatialContinuityLoss
 
 ## Funcion para probar modelo IA y ver resultados
 def probar_modelo(model, test_loader, device, num_images=3):
@@ -58,7 +59,7 @@ def probar_modelo(model, test_loader, device, num_images=3):
 ## Funcion para ver el nca, ve la pare encoding decoding sin el nca y con el nca implementado
 def comparar_modelos(model1, model2, test_loader, device, num_images=3):
     # 1. Definir el criterio de pérdida (debe ser el mismo usado en el entrenamiento)
-    criterion = nn.CrossEntropyLoss()
+    criterion = MulticlassDiceLoss() 
     
     model1.eval()
     model2.eval()
@@ -88,7 +89,7 @@ def comparar_modelos(model1, model2, test_loader, device, num_images=3):
     fig, axes = plt.subplots(num_images, 4, figsize=(18, num_images * 4))
     
     # Añadimos un título general con las pérdidas promedio del batch
-    fig.suptitle(f'Comparación de Desempeño\nLoss AE Base: {loss1:.4f} | Loss con NCA: {loss2:.4f}', 
+    fig.suptitle(f'Comparación de Desempeño DICE\nLoss AE Base: {loss1:.4f} | Loss con NCA: {loss2:.4f}', 
                  fontsize=16, fontweight='bold')
 
     for i in range(num_images):

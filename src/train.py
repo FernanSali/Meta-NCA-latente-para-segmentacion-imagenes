@@ -11,6 +11,98 @@ from src.model import AutoEncoderDown3, MetaNCASegmenter, NCASegmenter
 
 from src.datadogs import dog_train_loader, dog_test_loader
 
+import torch.nn.functional as F
+
+## implementaremos una Dice loss multiclase
+class MulticlassDiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6, weight=None):
+        """
+        smooth: Un valor muy pequeño para evitar la división por cero si 
+                la intersección y la unión son nulas.
+        weight: Pesos opcionales por clase (tensor de tamaño [num_classes])
+        """
+        super().__init__()
+        self.smooth = smooth
+        self.weight = weight
+
+    def forward(self, logits, targets):
+        """
+        logits: Tensor de la red de forma (Batch, Num_Classes, H, W)
+        targets: Tensor con las máscaras reales de forma (Batch, H, W) con índices enteros [0, Num_Classes-1]
+        """
+        # Convertir logits a probabilidades usando Softmax en la dimensión de los canales
+        probs = F.softmax(logits, dim=1)
+        num_classes = probs.shape[1]
+        
+        # Convertir targets (índices) a codificación One-Hot -> (Batch, Num_Classes, H, W)
+        # Hacemos el permute para mover la dimensión de los canales al orden correcto
+        targets_one_hot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+        
+        # Colapsar las dimensiones espaciales (H, W) para operar vectorialmente por lote y clase
+        # Quedan de forma: (Batch, Num_Classes, H*W)
+        probs = probs.contiguous().view(probs.shape[0], num_classes, -1)
+        targets_one_hot = targets_one_hot.contiguous().view(targets_one_hot.shape[0], num_classes, -1)
+        
+        # Calcular Intersección y Unión por cada muestra y cada clase
+        intersection = torch.sum(probs * targets_one_hot, dim=-1)
+        cardinality = torch.sum(probs + targets_one_hot, dim=-1)
+        
+        # Aplicar la fórmula del coeficiente Dice
+        dice_score = (2. * intersection + self.smooth) / (cardinality + self.smooth)
+        
+        # La pérdida es la inversa del coeficiente (queremos maximizar Dice, por ende minimizar 1 - Dice)
+        dice_loss = 1.0 - dice_score
+        
+        # Promediar las pérdidas de las muestras del Batch
+        # Queda un vector de tamaño [num_classes]
+        class_losses = dice_loss.mean(dim=0)
+        
+        # Si hay pesos por clase asignados (ej: para darle más importancia al borde), los aplicamos
+        if self.weight is not None:
+            # Asegurar que el tensor de pesos esté en el mismo dispositivo de cómputo
+            weight = self.weight.to(logits.device)
+            class_losses = class_losses * (weight / weight.sum())
+            return class_losses.sum()
+        
+        # Si no hay pesos, devolvemos el promedio simple de todas las clases
+        return class_losses.mean()
+    
+## Y tambien una spatial continuity loss, (TV loss)
+class SpatialContinuityLoss(nn.Module):
+    def __init__(self, alpha=1e-4):
+        """
+        alpha: Factor de escala para controlar qué tan fuerte es la penalización.
+               Un valor muy alto puede borrar bordes reales; un valor muy bajo no limpiará el ruido.
+        """
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, logits):
+        """
+        logits: Tensor flotante que escupe tu decoder, con forma (Batch, Classes, H, W)
+        """
+        # 1. Asegurar que operamos sobre probabilidades flotantes [0, 1]
+        probs = F.softmax(logits, dim=1)
+        
+        # 2. Calcular la diferencia absoluta entre píxeles vecinos horizontales
+        # Compara el píxel (x) con su vecino de la derecha (x+1)
+        diff_h = torch.abs(probs[:, :, :, :-1] - probs[:, :, :, 1:])
+        
+        # 3. Calcular la diferencia absoluta entre píxeles vecinos verticales
+        # Compara el píxel (y) con su vecino de abajo (y+1)
+        diff_v = torch.abs(probs[:, :, :-1, :] - probs[:, :, 1:, :])
+        
+        # 4. Reducir a escalares sumando todas las diferencias de forma independiente
+        # Al aplicar .sum() o .mean(), colapsamos las dimensiones espaciales y evitamos errores de tamaño
+        loss_h = diff_h.mean()
+        loss_v = diff_v.mean()
+        
+        # 5. Combinar las fuerzas y aplicar el factor alpha
+        total_tv = loss_h + loss_v
+        
+        return self.alpha * total_tv
+
+
 
 ## archivo con ejemplos de entrenamientos para las 2 fases del modelo
 
@@ -19,27 +111,47 @@ from src.datadogs import dog_train_loader, dog_test_loader
 ## ae_model = AutoEncoderDown3(ae_params).to(device)
 def train_ae(ae_model, train_loader, epochs=10, device='cuda'):
     '''Entrenemiento del autoencoder solo, fase 1'''
-    criterion = nn.CrossEntropyLoss() # Ideal para las 3 clases del trimapa
+    ae_model.to(device)
+
+    criterion1 = nn.CrossEntropyLoss() # Ideal para las 3 clases del trimapa
+    criterion2 = MulticlassDiceLoss() # Para mejorar la segmentación de bordes y detalles finos
+    criterion3 = SpatialContinuityLoss(alpha=1e-1) # Para fomentar la continuidad espacial en las predicciones
+    
     optimizer = optim.Adam(ae_model.parameters(), lr=1e-4)
 
+    print(f"Iniciando Fase 1 directamente en el Autoencoder por {epochs} épocas...")
+
     for epoch in range(epochs):  # Número de épocas
+        ae_model.train()  # Modo entrenamiento
+
+        running_loss = 0.0
+
+
         for images, masks in train_loader:
             images = images.to(device)
-            masks = masks.to(device) # Debe ser (N, H, W) con valores {0, 1, 2}
+            masks = masks.to(device).long() # Debe ser (N, H, W) con valores {0, 1, 2}
 
             # Forward
             # 'reconstruction' será tu predicción de máscara (N, 3, H, W)
             outputs, _ = ae_model(images) 
-            
-            loss = criterion(outputs, masks)
+
+            # Suma de las 3 losses: Píxel (CE) + Región (Dice) + Suavizado (TV)
+            loss_ce = criterion1(outputs, masks)
+            loss_dice = criterion2(outputs, masks)
+            loss_tv = criterion3(outputs)
+
+            loss = loss_ce + loss_dice + loss_tv
             
             # Backward
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            running_loss += loss.item()
 
-        print(f"Época [{epoch+1}/{10}]")
+        # calculamos promedio epoca
+        print(f"Época [{epoch+1}/{epochs} - Loss promedio: {running_loss / len(train_loader):.4f})]")
+
         torch.cuda.empty_cache()
 
     # torch.save(ae_model.state_dict(), "")
