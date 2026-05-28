@@ -14,7 +14,9 @@ def probar_modelo(model, test_loader, device, num_images=3):
     model.eval()
     images, masks = next(iter(test_loader)) # Tomamos un batch del test_loader
 
-    criterion = nn.CrossEntropyLoss() 
+    criterion1 = nn.CrossEntropyLoss() 
+    criterion2 = MulticlassDiceLoss()
+    criterion3 = SpatialContinuityLoss()
     
     # Movemos al device
     images = images.to(device)
@@ -28,7 +30,7 @@ def probar_modelo(model, test_loader, device, num_images=3):
         # Aplicamos argmax en la dimensión de canales (1) para obtener la clase [0, 1, 2]
         preds = torch.argmax(logits, dim=1)
 
-        loss = criterion(logits, masks).item()
+        loss = criterion1(logits, masks).item() + criterion2(logits, masks).item() + criterion3(logits).item()
         print(f"Loss en el batch de prueba: {loss:.4f}")
 
     # Visualización

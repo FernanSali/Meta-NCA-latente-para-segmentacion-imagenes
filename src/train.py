@@ -13,6 +13,7 @@ from src.datadogs import dog_train_loader, dog_test_loader
 
 import torch.nn.functional as F
 
+
 ## implementaremos una Dice loss multiclase
 class MulticlassDiceLoss(nn.Module):
     def __init__(self, smooth=1e-6, weight=None):
@@ -166,22 +167,32 @@ class NCAPool:
         self.pool = torch.zeros(pool_size, channels, h, w).to(device)
         self.device = device
 
-    def sample(self, batch_size, current_latent):
+        ## guardamos la salida original del encoder
+        self.pool_base = torch.zeros(pool_size, channels, h, w, device=device)
+
+        ## guarda las mascaras correspondientes al estado latente
+        self.pool_masks = torch.zeros(pool_size, 4*h, 4*w, dtype=torch.long, device=device)
+
+        ## guarda el c1
+        self.pool_c1 = torch.zeros(pool_size, 32, 4*h, 4*w, device=device)
+
+    def sample(self, batch_size, current_latent, current_c1, current_masks):
         '''muestrea elemetos del pool de forma estocastica (95% viejos, 5% nuevos/reset)'''
         ## Seleccionamos índices al azar del pool
         idx = torch.randint(0, self.size, (batch_size,), device=self.device)
 
         ## copiamos lo estados guardados en esos indices
         sampled_states = self.pool[idx].clone()
+        sampled_bases = self.pool_base[idx].clone()
+        sampled_masks = self.pool_masks[idx].clone()
+        sampled_c1 = self.pool_c1[idx].clone()
 
         # Detectar qué elementos muestreados están completamente vacíos (en ceros)
         # Calculamos la suma absoluta a lo largo de las dimensiones de Canales, Alto y Ancho 
         # Si la suma es 0, el tensor está vacío.
         es_cero = (sampled_states.abs().sum(dim=[1, 2, 3]) == 0.0).float()
-        
         # Reshapeamos a [B, 1, 1, 1] para poder multiplicar por los tensores latentes
         es_cero_mask = es_cero.view(batch_size, 1, 1, 1)
-
         ## 5 % prob de reserear la salida del encoder
         reset_mask = (torch.rand(batch_size, 1, 1, 1, device=self.device) < 0.05).float()
 
@@ -193,12 +204,22 @@ class NCAPool:
 
         ## si reset_mask es 1 usamos el estado actual del encoder, si es 0 usamos el estado muestreado del pool
         x_input = current_latent * mascara_final_reset + sampled_states * (1.0 - mascara_final_reset)
+        x_base = current_latent * mascara_final_reset + sampled_bases * (1.0 - mascara_final_reset)
+        x_c1 = current_c1 * mascara_final_reset + sampled_c1 * (1.0 - mascara_final_reset)
 
-        return x_input, idx
 
-    def update(self, idx, new_states):
+        # Reshapeamos la máscara de reset para que se acople a las dimensiones (B, H, W) de las masks
+        reset_mask_spatial = mascara_final_reset.squeeze(1) # Pasa de (B, 1, 1, 1) a (B, 1, 1)
+        x_masks = current_masks * reset_mask_spatial.long() + sampled_masks * (1.0 - reset_mask_spatial).long()
+
+        return x_input, x_base, x_c1, x_masks, idx
+
+    def update(self, idx, new_states, original_bases, original_c1, final_masks):
         # Guardamos los estados evolucionados de vuelta en el buffer, sin gradietes
         self.pool[idx] = new_states.detach()
+        self.pool_base[idx] = original_bases.detach()
+        self.pool_c1[idx] = original_c1.detach()
+        self.pool_masks[idx] = final_masks.detach()
 
 
 ## antes hay que:
@@ -226,9 +247,12 @@ def train_metanca(metanca_model, train_loader, epochs=10, device='cuda'):
     optimizer = optim.Adam([
         {'params': [p for p in metanca_model.nca.parameters() if p.requires_grad]},
         {'params': [p for p in metanca_model.param_predictor.parameters() if p.requires_grad]}
-    ], lr=1e-3)
+    ], lr=1e-4)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion1 = nn.CrossEntropyLoss() # Ideal para las 3 clases del trimapa
+    criterion2 = MulticlassDiceLoss() # Para mejorar la segmentación de bordes y detalles finos
+    #criterion3 = SpatialContinuityLoss(alpha=1e-4) # Para fomentar la continuidad espacial en las predicciones
+
     metanca_model.to(device)
 
     metanca_model.train()  # Activa modo entrenamiento general para el predictor
@@ -244,13 +268,13 @@ def train_metanca(metanca_model, train_loader, epochs=10, device='cuda'):
     dezafectar_train()
 
 
-    total_loss = 0
-
     ## inicializamos el pool latnete
-    pool_latente = NCAPool(pool_size=1024, channels=256, h=64, w=64, device=device)
+    pool_latente = NCAPool(pool_size=512, channels=16, h=64, w=64, device=device)
     print(" Iniciando loop de prueba preliminar blindado...")
 
     for epoch in range(epochs):
+        total_loss = 0.0
+
         for i, (imgs, masks) in enumerate(train_loader):
             imgs, masks = imgs.to(device), masks.to(device)
             
@@ -266,38 +290,57 @@ def train_metanca(metanca_model, train_loader, epochs=10, device='cuda'):
 
                 sum_enc = c2_out + p2_out
                 latent_base = metanca_model.ae.conv_layer_3(sum_enc)
-            
-            # Generamos los pesos dinámicos a partir del lote actual
-            latent_vector = latent_base.mean(dim=[2, 3])
-            dynamic_weights = metanca_model.param_predictor(latent_vector)
+
             
             # MUESTREO DEL POOL
             # En lugar de usar siempre 'latent_base', dejamos que el pool decida estocásticamente
-            latent_input, pool_indices = pool_latente.sample(imgs.shape[0], latent_base)
+            latent_input, original_bases, original_c1, target_masks, pool_indices = pool_latente.sample(imgs.shape[0], latent_base, c1_out, masks)
+
+            # Generamos los pesos dinámicos a partir del lote actual
+            latent_vector_limpio = original_bases.mean(dim=[2, 3])  ## simulacion adn pr ahora
+            dynamic_weights = metanca_model.param_predictor(latent_vector_limpio)
+            
             
             # El NCA evoluciona el estado seleccionado (ya sea inicial o intermedio del pool)
-            latent_evolved = metanca_model.nca(latent_input, weights=dynamic_weights, steps=metanca_model.nca_steps)
+            ## ocupamos pasos aleatorios
+            pasos_tensor = torch.randint(low=8, high=16 + 1, size=(1,))
+            steps_nca = pasos_tensor.item()
+    
+            latent_evolved = metanca_model.nca(latent_input, weights=dynamic_weights, steps=steps_nca)
             
             # ACTUALIZACIÓN DEL POOL
             # Guardamos los estados resultantes en el pool para la siguiente oportunidad
-            pool_latente.update(pool_indices, latent_evolved)
+            pool_latente.update(pool_indices, latent_evolved, original_bases, original_c1, target_masks)
+
             
             # DECODER FINAL Y PÉRDIDA
             # El decoder toma los estados evolucionados para proyectar a la máscara final
             d3_out = metanca_model.ae.trans_conv_3(latent_evolved)
             d2_out = metanca_model.ae.trans_conv_2(d3_out)
-            sum_dec = d2_out + c1_out # Inyección del skip connection original
+
+            sum_dec = d2_out + original_c1  # Inyección del skip connection original
+
             mixed = metanca_model.ae.mix_layer(sum_dec)
             outputs = metanca_model.ae.trans_conv_1(mixed)
             
-            ## optimizacion estandar
-            loss = criterion(outputs, masks)
+            ## optimizacion clasica
+            # Suma de las 3 losses: Píxel (CE) + Región (Dice) + Suavizado (TV)
+            loss_ce = criterion1(outputs, target_masks)
+            loss_dice = criterion2(outputs, target_masks)
+            #loss_tv = criterion3(outputs)
+
+            loss = loss_ce + loss_dice #+ loss_tv
+
             loss.backward()
+
+            # Escudo anti-explosión final
+            #torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, metanca_model.parameters()), max_norm=1.0)
+
             optimizer.step()
             
             # Restricción matemática de estabilidad del autómata celular
             with torch.no_grad():
-                metanca_model.nca.leak_factor.clamp_(1e-3, 1e3)
+                metanca_model.nca.leak_factor.clamp_(1e-3, 1e-1)
             
             total_loss += loss.item()
 
@@ -305,6 +348,8 @@ def train_metanca(metanca_model, train_loader, epochs=10, device='cuda'):
                 print(f"\n✅ Van {i + 1} batches procesados exitosamente.")
                 print(f"📊 Loss promedio actual: {total_loss / (i + 1):.4f}")
                 print(f"💧 Leak Factor actual: {metanca_model.nca.leak_factor.item():.4f}")
+
+        print(f"\n🎯 Época [{epoch+1}/{epochs}] - Loss promedio: {total_loss / len(train_loader):.4f}")
             
             
     # lo guardamos al final
