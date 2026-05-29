@@ -270,7 +270,7 @@ def train_metanca(metanca_model, train_loader, epochs=10, device='cuda'):
 
     ## inicializamos el pool latnete
     pool_latente = NCAPool(pool_size=512, channels=16, h=64, w=64, device=device)
-    print(" Iniciando loop de prueba preliminar blindado...")
+    print(" IIniciando loop de prueba preliminar blindado...")
 
     for epoch in range(epochs):
         total_loss = 0.0
@@ -303,8 +303,13 @@ def train_metanca(metanca_model, train_loader, epochs=10, device='cuda'):
             
             # El NCA evoluciona el estado seleccionado (ya sea inicial o intermedio del pool)
             ## ocupamos pasos aleatorios
-            pasos_tensor = torch.randint(low=8, high=16 + 1, size=(1,))
-            steps_nca = pasos_tensor.item()
+
+            if epoch <= 3:
+                pasos_tensor = torch.randint(low=8, high=16 + 1, size=(1,))
+                steps_nca = pasos_tensor.item()
+            else:
+                pasos_tensor = torch.randint(low=8, high=32 + 1, size=(1,))
+                steps_nca = pasos_tensor.item()
     
             latent_evolved = metanca_model.nca(latent_input, weights=dynamic_weights, steps=steps_nca)
             

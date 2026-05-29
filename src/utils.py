@@ -30,8 +30,8 @@ def probar_modelo(model, test_loader, device, num_images=3):
         # Aplicamos argmax en la dimensión de canales (1) para obtener la clase [0, 1, 2]
         preds = torch.argmax(logits, dim=1)
 
-        loss = criterion1(logits, masks).item() + criterion2(logits, masks).item() + criterion3(logits).item()
-        print(f"Loss en el batch de prueba: {loss:.4f}")
+        loss =  criterion2(logits, masks).item()
+        print(f"Loss en el batch de prueba (dice): {loss:.4f}")
 
     # Visualización
     fig, axes = plt.subplots(num_images, 3, figsize=(12, num_images * 4))
@@ -121,11 +121,13 @@ def comparar_modelos(model1, model2, test_loader, device, num_images=3):
 
 
 
-def calculo_perdida(model, test_loader, device):
+def calculo_perdida(model, test_loader, device, perdida = "dice"):
     # --- Cálculo de Loss en Test Set ---
     model.eval()
     test_loss = 0.0
-    criterion = nn.CrossEntropyLoss()
+    criterion1 = nn.CrossEntropyLoss() 
+    criterion2 = MulticlassDiceLoss()
+    criterion3 = SpatialContinuityLoss()
 
     with torch.no_grad():
         for images, masks in test_loader:
@@ -134,11 +136,18 @@ def calculo_perdida(model, test_loader, device):
             # Obtenemos logits del modelo (ignoramos el espacio latente _)
             logits, _ = model(images)
             
-            loss = criterion(logits, masks)
+            if perdida == "dice":
+                loss = criterion2(logits, masks)
+            elif perdida == "cross_entropy":
+                loss = criterion1(logits, masks)
+            elif perdida == "spatial_continuity":
+                loss = criterion3(logits)
+
             test_loss += loss.item()
 
     avg_test_loss = test_loss / len(test_loader)
-    print(f"\n[EVAL] Loss promedio en Test Loader: {avg_test_loss:.4f}")
+    #print(f"\n[EVAL] Loss promedio en Test Loader: {avg_test_loss:.4f}")
+    return avg_test_loss
 
 
 
