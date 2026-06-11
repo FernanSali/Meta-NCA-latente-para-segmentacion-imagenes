@@ -33,7 +33,7 @@ pet_data_test = datasets.OxfordIIITPet(root="data", split="test", target_types="
 
 
 ## dataloader
-batch_size = 8 # Ajusta según tu memoria de video (VRAM)
+batch_size = 4 # Ajusta según tu memoria de video (VRAM)
 
 dog_train_loader = DataLoader(
     pet_data_train, 

@@ -161,7 +161,7 @@ def train_ae(ae_model, train_loader, epochs=10, device='cuda'):
 ## Pool de entrenamiento para estabilidad de los NCA
 class NCAPool:
     '''pool de estados latentes para la estabilidad de los NCA'''
-    def __init__(self, pool_size, channels, h, w, device):
+    def __init__(self, pool_size, channels, h, w, device, CHANNELS_LEVEL_1 = 64):
         # El pool guarda el estado latente completo (N, C, H, W) 
         self.size = pool_size
         self.pool = torch.zeros(pool_size, channels, h, w).to(device)
@@ -174,7 +174,7 @@ class NCAPool:
         self.pool_masks = torch.zeros(pool_size, 4*h, 4*w, dtype=torch.long, device=device)
 
         ## guarda el c1
-        self.pool_c1 = torch.zeros(pool_size, 32, 4*h, 4*w, device=device)
+        self.pool_c1 = torch.zeros(pool_size, CHANNELS_LEVEL_1 , 4*h, 4*w, device=device)
 
     def sample(self, batch_size, current_latent, current_c1, current_masks):
         '''muestrea elemetos del pool de forma estocastica (95% viejos, 5% nuevos/reset)'''

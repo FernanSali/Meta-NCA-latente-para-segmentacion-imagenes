@@ -233,13 +233,13 @@ class ParameterPredictor(nn.Module):
     
 ## integramos el autoencoder con el dynamic NCA en un modelo 
 class MetaNCASegmenter(nn.Module):
-    def __init__(self, ae_params, nca_steps=32):
+    def __init__(self, ae_params, nca_steps=32, nca_hidden_dims=64):
         super().__init__()
         self.ae = AutoEncoderDown3(ae_params)
         self.nca_steps = nca_steps
         
         latent_channels = ae_params['Conv2DParams3']['out_c']
-        self.nca = DynamicLatentNCA(channels=latent_channels)
+        self.nca = DynamicLatentNCA(channels=latent_channels, hidden_dims=nca_hidden_dims)
         self.param_predictor = ParameterPredictor(latent_dim=latent_channels, h_nca=self.nca.hidden_dims, out_nca=latent_channels)
 
     def forward(self, x, steps=None):
