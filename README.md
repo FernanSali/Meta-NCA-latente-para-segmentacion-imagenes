@@ -26,6 +26,46 @@ Un módulo externo (actuando como una *HyperNetwork* o modulador) analiza el con
     $$z_{t+1} = z_t + \text{MetaNCA}(z_t)$$
 4.  **Decoder:** Toma el estado latente estabilizado $z_N$ y las conexiones *skip* para proyectar el resultado final a la máscara de segmentación de tres clases (Background, Foregound, Boundary).
 
+
+graph TD
+    %% Estilos
+    classDef input fill:#f3f4f6,stroke:#9ca3af,stroke-width:2px,rx:5px;
+    classDef block fill:#eff6ff,stroke:#3b82f6,stroke-width:2px;
+    classDef meta fill:#faf5ff,stroke:#a855f7,stroke-width:2px;
+    classDef latent fill:#fff7ed,stroke:#f97316,stroke-width:2px;
+
+    %% Nodos
+    In["Imagen de Entrada<br>x ∈ ℝ^(B × 3 × 256 × 256)"]:::input
+    Enc["Encoder Base<br>(AutoEncoderDown3)"]:::block
+    Lat0["Espacio Latente Inicial<br>z_0 ∈ ℝ^(B × 256 × 32 × 32)"]:::latent
+    GAP["Global Average<br>Pooling"]:::meta
+    Pred["Parameter Predictor<br>(ParameterPredictor)"]:::meta
+    Sobel["Filtros de Sobel<br>(Percepción Fija)"]:::block
+    NCA["Dynamic Latent NCA<br>(MetaNCASegmenter)"]:::block
+    LatT["Espacio Latente Evolucionado<br>z_T ∈ ℝ^(B × 256 × 32 × 32)"]:::latent
+    Dec["Decoder Base<br>(Mezcla y Proyección)"]:::block
+    Out["Logits / Máscara Final<br>ŷ ∈ ℝ^(B × 3 × 256 × 256)"]:::input
+
+    %% Flujo Principal
+    In --> Enc
+    Enc --> Lat0
+    
+    %% Rama Izquierda (Meta)
+    Lat0 --> GAP
+    GAP --> Pred
+    
+    %% Rama Derecha (NCA)
+    Lat0 --> Sobel
+    Sobel --> NCA
+    
+    %% Conexiones Cruzadas e Inyecciones
+    Pred -.->|Pesos Dinámicos| NCA
+    NCA --> LatT
+    LatT --> Dec
+    Dec --> Out
+    
+    %% Skip Connection
+    Enc -.->|Conexión de Salto c1_out| Dec
 ---
 
 ## Estrategia de Entrenamiento (Fases)
